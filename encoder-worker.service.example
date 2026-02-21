@@ -1,0 +1,25 @@
+[Unit]
+Description=Ruwaq Encoder Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ruwaq_jawi/scripts
+EnvironmentFile=/opt/ruwaq_jawi/scripts/.env
+ExecStart=/usr/bin/npm run encoder:worker
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ruwaq_jawi/scripts /tmp/ruwaq-encoder
+
+[Install]
+WantedBy=multi-user.target

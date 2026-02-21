@@ -1,0 +1,23 @@
+{
+    "name": "ruwaq-video-tools",
+    "version": "1.0.0",
+    "description": "Video transcoding tools for Ruwaq Jawi",
+    "main": "transcode-video.js",
+    "scripts": {
+        "transcode": "node transcode-video.js",
+        "encoder:worker": "node encode-worker.js",
+        "encoder:docker:build": "docker compose -f docker-compose.encoder.yml build",
+        "encoder:docker:up": "docker compose -f docker-compose.encoder.yml up -d",
+        "encoder:docker:down": "docker compose -f docker-compose.encoder.yml down",
+        "encoder:docker:logs": "docker compose -f docker-compose.encoder.yml logs -f ruwaq-encoder",
+        "test": "echo \"No tests specified\" && exit 0"
+    },
+    "dependencies": {
+        "@aws-sdk/client-s3": "^3.500.0",
+        "@supabase/supabase-js": "^2.39.0",
+        "dotenv": "^16.3.1"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}

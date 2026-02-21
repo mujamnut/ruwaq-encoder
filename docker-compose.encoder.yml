@@ -1,0 +1,19 @@
+services:
+  ruwaq-encoder:
+    build:
+      context: .
+      dockerfile: Dockerfile.encoder
+    container_name: ruwaq-encoder
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      ENCODER_TEMP_DIR: /tmp/ruwaq-encoder
+    volumes:
+      - encoder-temp:/tmp/ruwaq-encoder
+
+volumes:
+  encoder-temp:
+

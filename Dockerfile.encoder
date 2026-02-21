@@ -1,0 +1,23 @@
+FROM node:20-bookworm-slim
+
+# Install ffmpeg/ffprobe required by encode-worker.js
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install dependencies first for better layer caching
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy worker scripts
+COPY encode-worker.js ./encode-worker.js
+COPY transcode-video.js ./transcode-video.js
+
+# Default runtime env (can be overridden from env file)
+ENV NODE_ENV=production
+ENV ENCODER_TEMP_DIR=/tmp/ruwaq-encoder
+
+CMD ["npm", "run", "encoder:worker"]
+
