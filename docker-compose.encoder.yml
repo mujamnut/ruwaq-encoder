@@ -13,7 +13,8 @@ services:
       ENCODER_TEMP_DIR: /tmp/ruwaq-encoder
     volumes:
       - encoder-temp:/tmp/ruwaq-encoder
+      - encoder-model-cache:/root/.cache
 
 volumes:
   encoder-temp:
-
+  encoder-model-cache:

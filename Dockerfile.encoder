@@ -2,8 +2,18 @@ FROM node:20-bookworm-slim
 
 # Install ffmpeg/ffprobe required by encode-worker.js
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+        python3 \
+        python3-venv \
+        python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Python environment used by auto subtitle generator.
+RUN python3 -m venv /opt/subtitle-venv \
+    && /opt/subtitle-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/subtitle-venv/bin/pip install --no-cache-dir faster-whisper==1.1.1
 
 WORKDIR /app
 
@@ -14,10 +24,12 @@ RUN npm ci --omit=dev
 # Copy worker scripts
 COPY encode-worker.js ./encode-worker.js
 COPY transcode-video.js ./transcode-video.js
+COPY generate-subtitles.py ./generate-subtitles.py
 
 # Default runtime env (can be overridden from env file)
 ENV NODE_ENV=production
 ENV ENCODER_TEMP_DIR=/tmp/ruwaq-encoder
+ENV SUBTITLE_PYTHON_BIN=/opt/subtitle-venv/bin/python
+ENV SUBTITLE_SCRIPT_PATH=/app/generate-subtitles.py
 
 CMD ["npm", "run", "encoder:worker"]
-
