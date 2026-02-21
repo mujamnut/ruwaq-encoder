@@ -424,6 +424,15 @@ async function markJobComplete(jobId, result) {
     await apiRequest("POST", `/api/admin/encoding-jobs/${jobId}/complete`, result)
 }
 
+async function markJobProgress(jobId, progress) {
+    try {
+        await apiRequest("POST", `/api/admin/encoding-jobs/${jobId}/progress`, progress)
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        log(`Progress update failed for job ${jobId}: ${message}`, "warn")
+    }
+}
+
 async function downloadFile(url, destinationPath) {
     const response = await fetch(url)
     if (!response.ok || !response.body) {
@@ -958,6 +967,10 @@ async function processJob(job) {
     ensureDir(workDir)
 
     try {
+        await markJobProgress(job.id, {
+            stage: "preparing_source",
+            message: "Downloading source video",
+        })
         log(`Downloading source for job ${job.id}`)
         await downloadSourceForJob(job, sourcePath)
 
@@ -984,6 +997,10 @@ async function processJob(job) {
             )} audio=${hasAudio} requested=${requestedQualitiesLog} selected=${selectedQualitiesLog} subtitle_mode=${subtitleModeLog} manual_subtitles=${manualSubtitleLog} auto_languages=${autoLanguagesLog}`,
         )
 
+        await markJobProgress(job.id, {
+            stage: "transcoding_hls",
+            message: `Transcoding HLS renditions (${selectedQualitiesLog})`,
+        })
         await transcodeToHls({
             inputPath: sourcePath,
             outputDir,
@@ -994,19 +1011,37 @@ async function processJob(job) {
 
         const remotePrefix = `hls/${job.content_item_id}`
         log(`Uploading HLS output for job ${job.id} to ${remotePrefix}`)
+        await markJobProgress(job.id, {
+            stage: "uploading_hls",
+            message: "Uploading HLS segments and playlists",
+        })
         await uploadDirectory(outputDir, remotePrefix, CONFIG.uploadConcurrency)
 
         let uploadedManualTracks = []
         if (isManualSubtitleModeEnabled()) {
-            uploadedManualTracks = await processSubtitleTracks({
-                subtitleTracks: manualSubtitleTracks,
-                workDir,
-                remotePrefix,
+            await markJobProgress(job.id, {
+                stage: "processing_manual_subtitles",
+                message: manualSubtitleTracks.length > 0
+                    ? `Processing ${manualSubtitleTracks.length} manual subtitle track(s)`
+                    : "No manual subtitles provided",
             })
+            if (manualSubtitleTracks.length > 0) {
+                uploadedManualTracks = await processSubtitleTracks({
+                    subtitleTracks: manualSubtitleTracks,
+                    workDir,
+                    remotePrefix,
+                })
+            }
         }
 
         let uploadedAutoTracks = []
         if (isAutoSubtitleModeEnabled()) {
+            await markJobProgress(job.id, {
+                stage: "generating_auto_subtitles",
+                message: CONFIG.subtitles.languages.length > 0
+                    ? `Generating auto subtitles (${CONFIG.subtitles.languages.join(",")})`
+                    : "Generating auto subtitles (auto-detect)",
+            })
             if (!hasAudio) {
                 const message = `Auto subtitle generation skipped for job ${job.id}: source has no audio stream`
                 if (CONFIG.subtitles.required) {
@@ -1049,6 +1084,10 @@ async function processJob(job) {
             qualityUrls[quality.name] = `${CONFIG.cdnBaseUrl}/${remotePrefix}/${quality.name}/playlist.m3u8`
         }
 
+        await markJobProgress(job.id, {
+            stage: "finalizing",
+            message: "Finalizing playback metadata",
+        })
         await markJobComplete(job.id, {
             master_url: masterUrl,
             quality_urls: qualityUrls,
