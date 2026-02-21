@@ -13,7 +13,9 @@ RUN apt-get update \
 # Install Python environment used by auto subtitle generator.
 RUN python3 -m venv /opt/subtitle-venv \
     && /opt/subtitle-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/subtitle-venv/bin/pip install --no-cache-dir faster-whisper==1.1.1
+    && /opt/subtitle-venv/bin/pip install --no-cache-dir \
+        faster-whisper==1.1.1 \
+        requests
 
 WORKDIR /app
 
