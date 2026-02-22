@@ -440,6 +440,12 @@ const CONFIG = {
             normalizeOptionalString(process.env.SUBTITLE_SCRIPT_PATH) || path.join(__dirname, "generate-subtitles.py"),
         ),
         required: parseEnvBoolean(process.env.SUBTITLE_REQUIRED, false),
+        preprocessAudio: parseEnvBoolean(process.env.SUBTITLE_PREPROCESS_AUDIO, true),
+        preprocessRequired: parseEnvBoolean(process.env.SUBTITLE_PREPROCESS_REQUIRED, false),
+        preprocessSampleRate: parsePositiveInt(process.env.SUBTITLE_PREPROCESS_SAMPLE_RATE, 16000),
+        preprocessChannels: parsePositiveInt(process.env.SUBTITLE_PREPROCESS_CHANNELS, 1),
+        preprocessFilter: normalizeOptionalString(process.env.SUBTITLE_PREPROCESS_FILTER)
+            || "highpass=f=80,lowpass=f=7600,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11",
     },
     b2: {
         endpoint: process.env.B2_ENDPOINT,
@@ -952,6 +958,60 @@ async function generateAutoSubtitleTrack({
     })
 }
 
+async function preprocessAudioForSubtitle({ sourcePath, outputPath }) {
+    const ffmpegArgs = [
+        "-y",
+        "-i",
+        sourcePath,
+        "-vn",
+        "-ac",
+        String(CONFIG.subtitles.preprocessChannels),
+        "-ar",
+        String(CONFIG.subtitles.preprocessSampleRate),
+    ]
+    if (CONFIG.subtitles.preprocessFilter) {
+        ffmpegArgs.push("-af", CONFIG.subtitles.preprocessFilter)
+    }
+    ffmpegArgs.push("-c:a", "pcm_s16le", outputPath)
+
+    await new Promise((resolve, reject) => {
+        const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: "inherit" })
+        ffmpeg.on("error", (error) => reject(error))
+        ffmpeg.on("close", (code) => {
+            if (code === 0) resolve()
+            else reject(new Error(`ffmpeg audio preprocess exited with code ${code}`))
+        })
+    })
+}
+
+async function resolveAutoSubtitleInputPath({ sourcePath, subtitlesDir }) {
+    if (!CONFIG.subtitles.preprocessAudio) {
+        return sourcePath
+    }
+
+    const cleanedAudioPath = path.join(subtitlesDir, "input_stt.wav")
+    try {
+        log(
+            `Preprocessing audio for subtitle: ${CONFIG.subtitles.preprocessChannels}ch @ ${CONFIG.subtitles.preprocessSampleRate}Hz`,
+        )
+        await preprocessAudioForSubtitle({
+            sourcePath,
+            outputPath: cleanedAudioPath,
+        })
+        if (fs.existsSync(cleanedAudioPath)) {
+            return cleanedAudioPath
+        }
+        throw new Error("Preprocessed audio file missing after ffmpeg step")
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (CONFIG.subtitles.preprocessRequired) {
+            throw new Error(`Subtitle audio preprocess failed: ${message}`)
+        }
+        log(`Subtitle audio preprocess failed, fallback to source input: ${message}`, "warn")
+        return sourcePath
+    }
+}
+
 async function processSubtitleTracks({ subtitleTracks, workDir, remotePrefix }) {
     if (!Array.isArray(subtitleTracks) || subtitleTracks.length === 0) {
         return []
@@ -1021,6 +1081,10 @@ async function processAutoSubtitleTracks({
     const effectiveRequestedLanguages = normalizedRequestedLanguages.length > 0
         ? normalizedRequestedLanguages.slice(0, MAX_SUBTITLE_TRACKS)
         : [AUTO_SUBTITLE_LANG_TOKEN]
+    const subtitleInputPath = await resolveAutoSubtitleInputPath({
+        sourcePath,
+        subtitlesDir,
+    })
 
     const generatedTracks = []
     const usedBaseNames = new Set()
@@ -1035,7 +1099,7 @@ async function processAutoSubtitleTracks({
         const subtitleTarget = languageToken === AUTO_SUBTITLE_LANG_TOKEN ? "auto-detect" : languageToken
         log(`Generating auto subtitle (${subtitleTarget})`)
         await generateAutoSubtitleTrack({
-            sourcePath,
+            sourcePath: subtitleInputPath,
             outputPath,
             metaPath,
             language: languageToken,
@@ -1275,6 +1339,9 @@ async function runLoop() {
             : AUTO_SUBTITLE_LANG_TOKEN
         log(
             `Auto subtitle config: model=${CONFIG.subtitles.model} device=${CONFIG.subtitles.device} compute_type=${CONFIG.subtitles.computeType} languages=${languagesLog} required=${CONFIG.subtitles.required}`,
+        )
+        log(
+            `Subtitle preprocess: enabled=${CONFIG.subtitles.preprocessAudio} required=${CONFIG.subtitles.preprocessRequired} channels=${CONFIG.subtitles.preprocessChannels} sample_rate=${CONFIG.subtitles.preprocessSampleRate}`,
         )
     }
     if (!CONFIG.adminApiKey && CONFIG.allowDevNoKey) {
