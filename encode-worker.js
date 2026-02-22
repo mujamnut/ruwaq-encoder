@@ -75,20 +75,17 @@ function parseSubtitleMode(value) {
     return "manual"
 }
 
-function parseSubtitleLanguages(value) {
-    const raw = normalizeOptionalString(value)
-    if (!raw) return []
+function parseSubtitleLanguageCandidates(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return []
     const parsed = []
     const seen = new Set()
-    const parts = raw
-        .split(",")
-        .map((part) => part.trim())
-        .filter((part) => part.length > 0)
-        .slice(0, MAX_SUBTITLE_TRACKS)
 
-    for (const part of parts) {
+    for (const rawCandidate of candidates.slice(0, MAX_SUBTITLE_TRACKS)) {
+        const part = normalizeOptionalString(rawCandidate)
+        if (!part) continue
         const normalized = part.toLowerCase().replace(/_/g, "-")
         const language = normalized === "detect" ? AUTO_SUBTITLE_LANG_TOKEN : normalizeSubtitleLanguage(normalized)
+        if (language !== AUTO_SUBTITLE_LANG_TOKEN && language === "und") continue
         if (seen.has(language)) continue
         seen.add(language)
         parsed.push(language)
@@ -99,6 +96,25 @@ function parseSubtitleLanguages(value) {
         return [AUTO_SUBTITLE_LANG_TOKEN]
     }
     return parsed
+}
+
+function parseSubtitleLanguageList(value) {
+    if (Array.isArray(value)) {
+        return parseSubtitleLanguageCandidates(value)
+    }
+    if (typeof value === "string") {
+        return parseSubtitleLanguageCandidates(
+            value
+                .split(",")
+                .map((part) => part.trim())
+                .filter((part) => part.length > 0),
+        )
+    }
+    return []
+}
+
+function parseSubtitleLanguages(value) {
+    return parseSubtitleLanguageList(value)
 }
 
 function sanitizeFileToken(value, fallbackValue) {
@@ -218,6 +234,32 @@ function getContentMetadataFromJob(job) {
     return job?.content_metadata && typeof job.content_metadata === "object" && !Array.isArray(job.content_metadata)
         ? job.content_metadata
         : {}
+}
+
+function getEncodingMetadataFromJob(job) {
+    const contentMetadata = getContentMetadataFromJob(job)
+    return contentMetadata?.encoding && typeof contentMetadata.encoding === "object" && !Array.isArray(contentMetadata.encoding)
+        ? contentMetadata.encoding
+        : {}
+}
+
+function resolveAutoSubtitleLanguagesForJob(job) {
+    const contentMetadata = getContentMetadataFromJob(job)
+    const encodingMetadata = getEncodingMetadataFromJob(job)
+    const overrideLanguages = parseSubtitleLanguageList(
+        encodingMetadata.subtitle_languages
+        ?? encodingMetadata.subtitle_langs
+        ?? contentMetadata.subtitle_languages
+        ?? contentMetadata.subtitle_langs
+        ?? job?.subtitle_languages
+        ?? job?.subtitle_langs,
+    )
+    if (overrideLanguages.length > 0) {
+        return overrideLanguages
+    }
+    return CONFIG.subtitles.languages.length > 0
+        ? CONFIG.subtitles.languages.slice(0, MAX_SUBTITLE_TRACKS)
+        : [AUTO_SUBTITLE_LANG_TOKEN]
 }
 
 function extractQualityUrlsFromMetadata(contentMetadata) {
@@ -966,6 +1008,7 @@ async function processAutoSubtitleTracks({
     sourcePath,
     workDir,
     remotePrefix,
+    requestedLanguages,
 }) {
     if (!isAutoSubtitleModeEnabled()) {
         return []
@@ -974,15 +1017,16 @@ async function processAutoSubtitleTracks({
     const subtitlesDir = path.join(workDir, "subs-auto")
     ensureDir(subtitlesDir)
 
-    const requestedLanguages = CONFIG.subtitles.languages.length > 0
-        ? CONFIG.subtitles.languages.slice(0, MAX_SUBTITLE_TRACKS)
+    const normalizedRequestedLanguages = parseSubtitleLanguageList(requestedLanguages)
+    const effectiveRequestedLanguages = normalizedRequestedLanguages.length > 0
+        ? normalizedRequestedLanguages.slice(0, MAX_SUBTITLE_TRACKS)
         : [AUTO_SUBTITLE_LANG_TOKEN]
 
     const generatedTracks = []
     const usedBaseNames = new Set()
 
-    for (let index = 0; index < requestedLanguages.length; index += 1) {
-        const requestedLanguage = normalizeSubtitleLanguage(requestedLanguages[index])
+    for (let index = 0; index < effectiveRequestedLanguages.length; index += 1) {
+        const requestedLanguage = normalizeSubtitleLanguage(effectiveRequestedLanguages[index])
         const languageToken = requestedLanguage === "und" ? AUTO_SUBTITLE_LANG_TOKEN : requestedLanguage
         const outputName = sanitizeFileToken(`auto_${languageToken}`, `auto_${index + 1}`)
         const outputPath = path.join(subtitlesDir, `${outputName}.vtt`)
@@ -1058,6 +1102,7 @@ async function processJob(job) {
         const hasAudio = hasAudioStream(sourcePath)
         const subtitleOnly = isSubtitleOnlyJob(job)
         const manualSubtitleTracks = extractSubtitleTracksFromJob(job)
+        const autoSubtitleLanguages = resolveAutoSubtitleLanguagesForJob(job)
         const requestedQualitiesLog = Array.isArray(job.requested_qualities) && job.requested_qualities.length > 0
             ? job.requested_qualities.join(",")
             : "default"
@@ -1065,8 +1110,8 @@ async function processJob(job) {
         const manualSubtitleLog = manualSubtitleTracks.length > 0
             ? manualSubtitleTracks.map((track) => `${track.lang}:${track.label}`).join(",")
             : "none"
-        const autoLanguagesLog = CONFIG.subtitles.languages.length > 0
-            ? CONFIG.subtitles.languages.join(",")
+        const autoLanguagesLog = autoSubtitleLanguages.length > 0
+            ? autoSubtitleLanguages.join(",")
             : AUTO_SUBTITLE_LANG_TOKEN
         const defaultRemotePrefix = `hls/${job.content_item_id}`
         const existingMasterUrl = resolveExistingMasterUrl(job)
@@ -1148,8 +1193,8 @@ async function processJob(job) {
         if (isAutoSubtitleModeEnabled()) {
             await markJobProgress(job.id, {
                 stage: "generating_auto_subtitles",
-                message: CONFIG.subtitles.languages.length > 0
-                    ? `Generating auto subtitles (${CONFIG.subtitles.languages.join(",")})`
+                message: autoSubtitleLanguages.length > 0
+                    ? `Generating auto subtitles (${autoSubtitleLanguages.join(",")})`
                     : "Generating auto subtitles (auto-detect)",
             })
             if (!hasAudio) {
@@ -1164,6 +1209,7 @@ async function processJob(job) {
                         sourcePath,
                         workDir,
                         remotePrefix,
+                        requestedLanguages: autoSubtitleLanguages,
                     })
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error)
