@@ -25,6 +25,7 @@ const DEFAULT_QUALITIES = [
 ]
 const MAX_SUBTITLE_TRACKS = 10
 const AUTO_SUBTITLE_LANG_TOKEN = "auto"
+const SUBTITLE_ONLY_QUALITY_TOKEN = "__subtitle_only__"
 
 function normalizeOptionalString(value) {
     if (typeof value !== "string") {
@@ -91,6 +92,11 @@ function parseSubtitleLanguages(value) {
         if (seen.has(language)) continue
         seen.add(language)
         parsed.push(language)
+    }
+
+    // Keep detection stable: if auto-detect is configured, ignore additional forced languages.
+    if (parsed.includes(AUTO_SUBTITLE_LANG_TOKEN)) {
+        return [AUTO_SUBTITLE_LANG_TOKEN]
     }
     return parsed
 }
@@ -206,6 +212,80 @@ function extractSubtitleTracksFromJob(job) {
         if (normalized) normalizedTracks.push(normalized)
     })
     return dedupeSubtitleTracks(normalizedTracks)
+}
+
+function getContentMetadataFromJob(job) {
+    return job?.content_metadata && typeof job.content_metadata === "object" && !Array.isArray(job.content_metadata)
+        ? job.content_metadata
+        : {}
+}
+
+function extractQualityUrlsFromMetadata(contentMetadata) {
+    const qualityUrls = {}
+
+    const collectFromRecord = (recordValue) => {
+        if (!recordValue || typeof recordValue !== "object" || Array.isArray(recordValue)) return
+        for (const [label, urlRaw] of Object.entries(recordValue)) {
+            const normalizedLabel = normalizeQualityName(label)
+            const url = normalizeOptionalString(urlRaw)
+            if (!normalizedLabel || normalizedLabel === "auto" || !url) continue
+            if (!qualityUrls[normalizedLabel]) {
+                qualityUrls[normalizedLabel] = url
+            }
+        }
+    }
+
+    collectFromRecord(contentMetadata.quality_urls)
+    collectFromRecord(contentMetadata?.playback?.quality_urls)
+    collectFromRecord(contentMetadata?.encoding?.quality_urls)
+    return qualityUrls
+}
+
+function resolveExistingMasterUrl(job) {
+    const contentMetadata = getContentMetadataFromJob(job)
+    const candidates = [
+        contentMetadata.output_master_url,
+        contentMetadata.master_url,
+        contentMetadata?.encoding?.output_master_url,
+        contentMetadata?.encoding?.master_url,
+        contentMetadata?.playback?.master_url,
+    ]
+    for (const candidate of candidates) {
+        const parsed = normalizeOptionalString(candidate)
+        if (parsed) return parsed
+    }
+    return null
+}
+
+function deriveRemotePrefixFromMasterUrl(masterUrl) {
+    const normalized = normalizeOptionalString(masterUrl)
+    if (!normalized) return null
+
+    const parsePathname = (pathname) => {
+        const withoutMaster = pathname.replace(/\/master\.m3u8$/i, "")
+        const trimmed = withoutMaster.replace(/^\/+/, "").replace(/\/+$/, "")
+        return trimmed || null
+    }
+
+    try {
+        const parsed = new URL(normalized)
+        return parsePathname(parsed.pathname)
+    } catch {
+        const withoutQuery = normalized.split("?")[0].split("#")[0]
+        const pathname = /^[a-z]+:\/\//i.test(withoutQuery)
+            ? withoutQuery.replace(/^[a-z]+:\/\/[^/]+/i, "")
+            : withoutQuery
+        return parsePathname(pathname)
+    }
+}
+
+function isSubtitleOnlyRequestedQualities(requestedQualities) {
+    if (!Array.isArray(requestedQualities)) return false
+    return requestedQualities.some((item) => normalizeQualityName(item) === SUBTITLE_ONLY_QUALITY_TOKEN)
+}
+
+function isSubtitleOnlyJob(job) {
+    return isSubtitleOnlyRequestedQualities(job?.requested_qualities)
 }
 
 function inferSubtitleExtension(url) {
@@ -557,7 +637,7 @@ function selectQualitiesForJob(job, sourceVideoInfo) {
     const requested = Array.isArray(job.requested_qualities)
         ? job.requested_qualities
             .map((item) => normalizeQualityName(item))
-            .filter((item) => !!item && item !== "auto")
+            .filter((item) => !!item && item !== "auto" && item !== SUBTITLE_ONLY_QUALITY_TOKEN)
         : []
     const requestedSet = new Set(requested)
 
@@ -975,15 +1055,12 @@ async function processJob(job) {
         await downloadSourceForJob(job, sourcePath)
 
         const duration = getVideoDuration(sourcePath)
-        const videoInfo = getVideoInfo(sourcePath)
-        const fps = getVideoFps(sourcePath)
         const hasAudio = hasAudioStream(sourcePath)
-        const selectedQualities = selectQualitiesForJob(job, videoInfo)
+        const subtitleOnly = isSubtitleOnlyJob(job)
         const manualSubtitleTracks = extractSubtitleTracksFromJob(job)
         const requestedQualitiesLog = Array.isArray(job.requested_qualities) && job.requested_qualities.length > 0
             ? job.requested_qualities.join(",")
             : "default"
-        const selectedQualitiesLog = selectedQualities.map((quality) => quality.name).join(",")
         const subtitleModeLog = CONFIG.subtitles.mode
         const manualSubtitleLog = manualSubtitleTracks.length > 0
             ? manualSubtitleTracks.map((track) => `${track.lang}:${track.label}`).join(",")
@@ -991,31 +1068,64 @@ async function processJob(job) {
         const autoLanguagesLog = CONFIG.subtitles.languages.length > 0
             ? CONFIG.subtitles.languages.join(",")
             : AUTO_SUBTITLE_LANG_TOKEN
-        log(
-            `Transcoding job ${job.id}: duration=${duration || "?"}s size=${videoInfo.width || "?"}x${videoInfo.height || "?"} fps=${fps.toFixed(
-                2,
-            )} audio=${hasAudio} requested=${requestedQualitiesLog} selected=${selectedQualitiesLog} subtitle_mode=${subtitleModeLog} manual_subtitles=${manualSubtitleLog} auto_languages=${autoLanguagesLog}`,
-        )
+        const defaultRemotePrefix = `hls/${job.content_item_id}`
+        const existingMasterUrl = resolveExistingMasterUrl(job)
+        const remotePrefix = subtitleOnly
+            ? deriveRemotePrefixFromMasterUrl(existingMasterUrl) || defaultRemotePrefix
+            : defaultRemotePrefix
+        let masterUrl = existingMasterUrl || `${CONFIG.cdnBaseUrl}/${remotePrefix}/master.m3u8`
+        let qualityUrls = subtitleOnly
+            ? extractQualityUrlsFromMetadata(getContentMetadataFromJob(job))
+            : {}
 
-        await markJobProgress(job.id, {
-            stage: "transcoding_hls",
-            message: `Transcoding HLS renditions (${selectedQualitiesLog})`,
-        })
-        await transcodeToHls({
-            inputPath: sourcePath,
-            outputDir,
-            qualities: selectedQualities,
-            fps,
-            hasAudio,
-        })
+        if (subtitleOnly) {
+            const existingQualitiesLog = Object.keys(qualityUrls).length > 0
+                ? Object.keys(qualityUrls).join(",")
+                : "unknown"
+            log(
+                `Subtitle-only job ${job.id}: duration=${duration || "?"}s audio=${hasAudio} requested=${requestedQualitiesLog} existing_qualities=${existingQualitiesLog} subtitle_mode=${subtitleModeLog} manual_subtitles=${manualSubtitleLog} auto_languages=${autoLanguagesLog}`,
+            )
+            await markJobProgress(job.id, {
+                stage: "processing",
+                message: "Skipping HLS transcode (subtitle regeneration only)",
+            })
+        } else {
+            const videoInfo = getVideoInfo(sourcePath)
+            const fps = getVideoFps(sourcePath)
+            const selectedQualities = selectQualitiesForJob(job, videoInfo)
+            const selectedQualitiesLog = selectedQualities.map((quality) => quality.name).join(",")
 
-        const remotePrefix = `hls/${job.content_item_id}`
-        log(`Uploading HLS output for job ${job.id} to ${remotePrefix}`)
-        await markJobProgress(job.id, {
-            stage: "uploading_hls",
-            message: "Uploading HLS segments and playlists",
-        })
-        await uploadDirectory(outputDir, remotePrefix, CONFIG.uploadConcurrency)
+            log(
+                `Transcoding job ${job.id}: duration=${duration || "?"}s size=${videoInfo.width || "?"}x${videoInfo.height || "?"} fps=${fps.toFixed(
+                    2,
+                )} audio=${hasAudio} requested=${requestedQualitiesLog} selected=${selectedQualitiesLog} subtitle_mode=${subtitleModeLog} manual_subtitles=${manualSubtitleLog} auto_languages=${autoLanguagesLog}`,
+            )
+
+            await markJobProgress(job.id, {
+                stage: "transcoding_hls",
+                message: `Transcoding HLS renditions (${selectedQualitiesLog})`,
+            })
+            await transcodeToHls({
+                inputPath: sourcePath,
+                outputDir,
+                qualities: selectedQualities,
+                fps,
+                hasAudio,
+            })
+
+            log(`Uploading HLS output for job ${job.id} to ${remotePrefix}`)
+            await markJobProgress(job.id, {
+                stage: "uploading_hls",
+                message: "Uploading HLS segments and playlists",
+            })
+            await uploadDirectory(outputDir, remotePrefix, CONFIG.uploadConcurrency)
+
+            masterUrl = `${CONFIG.cdnBaseUrl}/${remotePrefix}/master.m3u8`
+            qualityUrls = {}
+            for (const quality of selectedQualities) {
+                qualityUrls[quality.name] = `${CONFIG.cdnBaseUrl}/${remotePrefix}/${quality.name}/playlist.m3u8`
+            }
+        }
 
         let uploadedManualTracks = []
         if (isManualSubtitleModeEnabled()) {
@@ -1076,12 +1186,6 @@ async function processJob(job) {
         finalizedSubtitleTracks = ensureDefaultSubtitleTrack(dedupeSubtitleTracks(finalizedSubtitleTracks))
         if (finalizedSubtitleTracks.length > 0) {
             log(`Uploaded ${finalizedSubtitleTracks.length} subtitle track(s) for job ${job.id}`)
-        }
-
-        const masterUrl = `${CONFIG.cdnBaseUrl}/${remotePrefix}/master.m3u8`
-        const qualityUrls = {}
-        for (const quality of selectedQualities) {
-            qualityUrls[quality.name] = `${CONFIG.cdnBaseUrl}/${remotePrefix}/${quality.name}/playlist.m3u8`
         }
 
         await markJobProgress(job.id, {
