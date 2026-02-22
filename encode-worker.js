@@ -771,9 +771,9 @@ async function uploadFile(localPath, remotePath) {
         : remotePath.endsWith(".ts")
             ? "video/MP2T"
             : remotePath.endsWith(".vtt")
-                ? "text/vtt"
+                ? "text/vtt; charset=utf-8"
                 : remotePath.endsWith(".srt")
-                    ? "application/x-subrip"
+                    ? "application/x-subrip; charset=utf-8"
                     : "application/octet-stream"
     const cacheControl = remotePath.endsWith(".m3u8")
         ? "public, max-age=30, s-maxage=30, stale-while-revalidate=60"
