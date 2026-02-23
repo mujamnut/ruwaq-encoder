@@ -358,6 +358,13 @@ function parsePositiveInt(value, fallbackValue) {
     return parsed
 }
 
+function parseHlsSegmentType(value) {
+    const normalized = normalizeOptionalString(value)?.toLowerCase()
+    if (normalized === "mpegts" || normalized === "ts") return "mpegts"
+    if (normalized === "fmp4" || normalized === "m4s") return "fmp4"
+    return "fmp4"
+}
+
 function normalizeQualityName(value) {
     return String(value || "").trim().toLowerCase()
 }
@@ -425,6 +432,7 @@ const CONFIG = {
     tempDir: process.env.ENCODER_TEMP_DIR || path.join(os.tmpdir(), "ruwaq-encoder"),
     cdnBaseUrl: (process.env.CDN_BASE_URL || "https://videos.mujam.store").replace(/\/+$/, ""),
     segmentDurationSeconds: parsePositiveInt(process.env.ENCODER_SEGMENT_DURATION_SECONDS, 2),
+    hlsSegmentType: parseHlsSegmentType(process.env.ENCODER_HLS_SEGMENT_TYPE),
     uploadConcurrency: parsePositiveInt(process.env.ENCODER_UPLOAD_CONCURRENCY, 4),
     uploadMaxAttempts: parsePositiveInt(process.env.ENCODER_UPLOAD_MAX_ATTEMPTS, 4),
     uploadRetryDelayMs: parsePositiveInt(process.env.ENCODER_UPLOAD_RETRY_DELAY_MS, 750),
@@ -725,6 +733,8 @@ async function transcodeToHls({
     hasAudio = true,
 }) {
     const segmentDurationSeconds = CONFIG.segmentDurationSeconds
+    const isFmp4Segments = CONFIG.hlsSegmentType === "fmp4"
+    const segmentExtension = isFmp4Segments ? "m4s" : "ts"
     const keyint = Math.max(24, Math.round(fps * segmentDurationSeconds))
     ensureDir(outputDir)
 
@@ -789,9 +799,17 @@ async function transcodeToHls({
         "-hls_flags",
         "independent_segments",
         "-hls_segment_type",
-        "mpegts",
+        CONFIG.hlsSegmentType,
+    )
+    if (isFmp4Segments) {
+        ffmpegArgs.push(
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+        )
+    }
+    ffmpegArgs.push(
         "-hls_segment_filename",
-        path.join(outputDir, "%v", "segment_%03d.ts"),
+        path.join(outputDir, "%v", `segment_%03d.${segmentExtension}`),
         "-var_stream_map",
         streamMap,
         path.join(outputDir, "%v", "playlist.m3u8"),
@@ -808,7 +826,7 @@ async function transcodeToHls({
         ffmpeg.on("error", (error) => reject(error))
     })
 
-    let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    let masterPlaylist = `#EXTM3U\n#EXT-X-VERSION:${isFmp4Segments ? 7 : 3}\n`
     qualities.forEach((quality) => {
         const videoBitrate = parseInt(String(quality.bitrate).replace(/[^\d]/g, ""), 10) * 1000
         const audioBitrate = hasAudio
@@ -853,16 +871,21 @@ function isRetryableUploadError(error) {
 }
 
 async function uploadFile(localPath, remotePath) {
-    const contentType = remotePath.endsWith(".m3u8")
+    const normalizedPath = String(remotePath || "").toLowerCase()
+    const contentType = normalizedPath.endsWith(".m3u8")
         ? "application/vnd.apple.mpegurl"
-        : remotePath.endsWith(".ts")
+        : normalizedPath.endsWith(".ts")
             ? "video/MP2T"
-            : remotePath.endsWith(".vtt")
+            : normalizedPath.endsWith(".m4s")
+                ? "video/iso.segment"
+                : normalizedPath.endsWith(".mp4")
+                    ? "video/mp4"
+                    : normalizedPath.endsWith(".vtt")
                 ? "text/vtt; charset=utf-8"
-                : remotePath.endsWith(".srt")
+                : normalizedPath.endsWith(".srt")
                     ? "application/x-subrip; charset=utf-8"
                     : "application/octet-stream"
-    const cacheControl = remotePath.endsWith(".m3u8")
+    const cacheControl = normalizedPath.endsWith(".m3u8")
         ? CONFIG.playlistCacheControl
         : CONFIG.segmentCacheControl
     const maxAttempts = Math.max(1, CONFIG.uploadMaxAttempts)
@@ -1413,6 +1436,7 @@ async function runLoop() {
     log(`B2 bucket: ${CONFIG.b2.bucketName}`)
     log(`B2 region: ${CONFIG.b2.region}`)
     log(`Upload concurrency: ${CONFIG.uploadConcurrency}`)
+    log(`HLS segment type: ${CONFIG.hlsSegmentType}`)
     log(`Cache policy: playlists="${CONFIG.playlistCacheControl}" segments="${CONFIG.segmentCacheControl}"`)
     log(`Subtitle mode: ${CONFIG.subtitles.mode}`)
     if (isAutoSubtitleModeEnabled()) {

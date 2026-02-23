@@ -209,8 +209,9 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
         '-hls_time', String(segmentDurationSeconds),  // 2-second segments for TikTok-like fast loading
         '-hls_playlist_type', 'vod',
         '-hls_flags', 'independent_segments',
-        '-hls_segment_type', 'mpegts',
-        '-hls_segment_filename', path.join(outputDir, '%v', 'segment_%03d.ts'),
+        '-hls_segment_type', 'fmp4',
+        '-hls_fmp4_init_filename', 'init.mp4',
+        '-hls_segment_filename', path.join(outputDir, '%v', 'segment_%03d.m4s'),
         '-var_stream_map', varStreamMap,
         path.join(outputDir, '%v', 'playlist.m3u8')
     );
@@ -239,7 +240,7 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
     // This ensures it's in the correct location for HLS playback
     log('Creating master playlist...', 'progress');
 
-    let masterPlaylist = '#EXTM3U\n#EXT-X-VERSION:3\n';
+    let masterPlaylist = '#EXTM3U\n#EXT-X-VERSION:7\n';
 
     qualities.forEach(q => {
         // Calculate bandwidth (bitrate in bits per second)
@@ -267,7 +268,11 @@ async function uploadFile(localPath, remotePath) {
         ? 'application/vnd.apple.mpegurl'
         : remotePath.endsWith('.ts')
             ? 'video/MP2T'
-            : 'application/octet-stream';
+            : remotePath.endsWith('.m4s')
+                ? 'video/iso.segment'
+                : remotePath.endsWith('.mp4')
+                    ? 'video/mp4'
+                    : 'application/octet-stream';
 
     const command = new PutObjectCommand({
         Bucket: CONFIG.b2.bucketName,
