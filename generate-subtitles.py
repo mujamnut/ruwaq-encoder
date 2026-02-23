@@ -21,6 +21,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compute-type", default="int8", help="Compute type (int8/float16/etc)")
     parser.add_argument("--beam-size", type=int, default=5, help="Beam size used for transcription")
     parser.add_argument(
+        "--progress-every-segments",
+        type=int,
+        default=20,
+        help="Log progress every N decoded segments",
+    )
+    parser.add_argument(
         "--no-vad-filter",
         action="store_true",
         help="Disable built-in voice activity detection filter",
@@ -97,22 +103,55 @@ def main() -> int:
             condition_on_previous_text=False,
         )
 
+        duration_seconds_raw = getattr(info, "duration", None)
+        try:
+            duration_seconds = float(duration_seconds_raw) if duration_seconds_raw is not None else None
+        except (TypeError, ValueError):
+            duration_seconds = None
+        progress_every = max(1, int(args.progress_every_segments))
+        requested_language = args.language or "auto"
+        print(
+            f"[subtitle] start language={requested_language} model={args.model} beam={max(1, int(args.beam_size))} duration={duration_seconds if duration_seconds is not None else 'unknown'}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         cues: List[Tuple[float, float, str]] = []
+        decoded_segments = 0
         for segment in segments_iterable:
+            decoded_segments += 1
             text = normalize_text(getattr(segment, "text", ""))
-            if not text:
-                continue
             start = float(getattr(segment, "start", 0.0))
             end = float(getattr(segment, "end", start))
             if end <= start:
                 end = start + 0.2
+
+            if decoded_segments % progress_every == 0:
+                if duration_seconds and duration_seconds > 0:
+                    percent = max(0.0, min(100.0, (end / duration_seconds) * 100.0))
+                    progress_suffix = f" ({percent:.1f}%)"
+                else:
+                    progress_suffix = ""
+                print(
+                    f"[subtitle] progress segments={decoded_segments} at={format_timestamp(end)}{progress_suffix}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            if not text:
+                continue
             cues.append((start, end, text))
+
+        print(
+            f"[subtitle] done segments={decoded_segments} cues={len(cues)}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         write_webvtt(args.output, cues)
 
         detected_language = getattr(info, "language", None)
         language_probability = getattr(info, "language_probability", None)
-        duration_seconds = getattr(info, "duration", None)
         metadata = {
             "language": detected_language,
             "language_probability": language_probability,

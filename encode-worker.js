@@ -426,6 +426,8 @@ const CONFIG = {
     cdnBaseUrl: (process.env.CDN_BASE_URL || "https://videos.mujam.store").replace(/\/+$/, ""),
     segmentDurationSeconds: parsePositiveInt(process.env.ENCODER_SEGMENT_DURATION_SECONDS, 2),
     uploadConcurrency: parsePositiveInt(process.env.ENCODER_UPLOAD_CONCURRENCY, 4),
+    uploadMaxAttempts: parsePositiveInt(process.env.ENCODER_UPLOAD_MAX_ATTEMPTS, 4),
+    uploadRetryDelayMs: parsePositiveInt(process.env.ENCODER_UPLOAD_RETRY_DELAY_MS, 750),
     ffmpegPreset: process.env.ENCODER_FFMPEG_PRESET || "veryfast",
     qualities: sortQualitiesAscending(parseQualities()),
     subtitles: {
@@ -435,6 +437,7 @@ const CONFIG = {
         device: normalizeOptionalString(process.env.SUBTITLE_DEVICE) || "cpu",
         computeType: normalizeOptionalString(process.env.SUBTITLE_COMPUTE_TYPE) || "int8",
         beamSize: parsePositiveInt(process.env.SUBTITLE_BEAM_SIZE, 5),
+        progressEverySegments: parsePositiveInt(process.env.SUBTITLE_PROGRESS_EVERY_SEGMENTS, 20),
         pythonBin: normalizeOptionalString(process.env.SUBTITLE_PYTHON_BIN) || "python3",
         scriptPath: path.resolve(
             normalizeOptionalString(process.env.SUBTITLE_SCRIPT_PATH) || path.join(__dirname, "generate-subtitles.py"),
@@ -812,8 +815,38 @@ async function transcodeToHls({
     fs.writeFileSync(path.join(outputDir, "master.m3u8"), masterPlaylist)
 }
 
+function isRetryableUploadError(error) {
+    if (!error) return false
+    const statusCode = Number(error?.$metadata?.httpStatusCode || 0)
+    if ([408, 409, 425, 429, 500, 502, 503, 504].includes(statusCode)) {
+        return true
+    }
+
+    const name = String(error?.name || error?.code || "").toLowerCase()
+    if (
+        name.includes("timeout")
+        || name.includes("network")
+        || name.includes("thrott")
+        || name.includes("econnreset")
+        || name.includes("etimedout")
+        || name.includes("socket")
+    ) {
+        return true
+    }
+
+    const message = String(error?.message || "").toLowerCase()
+    return (
+        message.includes("please retry your upload")
+        || message.includes("internal error")
+        || message.includes("non-retryable streaming request")
+        || message.includes("socket hang up")
+        || message.includes("timeout")
+        || message.includes("network")
+        || message.includes("connection reset")
+    )
+}
+
 async function uploadFile(localPath, remotePath) {
-    const body = fs.createReadStream(localPath)
     const contentType = remotePath.endsWith(".m3u8")
         ? "application/vnd.apple.mpegurl"
         : remotePath.endsWith(".ts")
@@ -826,14 +859,36 @@ async function uploadFile(localPath, remotePath) {
     const cacheControl = remotePath.endsWith(".m3u8")
         ? "public, max-age=30, s-maxage=30, stale-while-revalidate=60"
         : "public, max-age=31536000, immutable"
-    const command = new PutObjectCommand({
-        Bucket: CONFIG.b2.bucketName,
-        Key: remotePath,
-        Body: body,
-        ContentType: contentType,
-        CacheControl: cacheControl,
-    })
-    await s3Client.send(command)
+    const maxAttempts = Math.max(1, CONFIG.uploadMaxAttempts)
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            const body = fs.createReadStream(localPath)
+            const command = new PutObjectCommand({
+                Bucket: CONFIG.b2.bucketName,
+                Key: remotePath,
+                Body: body,
+                ContentType: contentType,
+                CacheControl: cacheControl,
+            })
+            await s3Client.send(command)
+            return
+        } catch (error) {
+            if (!(error instanceof Error)) {
+                throw error
+            }
+            const retryable = isRetryableUploadError(error)
+            if (!retryable || attempt >= maxAttempts) {
+                throw error
+            }
+            const waitMs = CONFIG.uploadRetryDelayMs * Math.pow(2, attempt - 1)
+            log(
+                `Upload retry ${attempt}/${maxAttempts} for ${remotePath}: ${error.message}. Retrying in ${waitMs}ms`,
+                "warn",
+            )
+            await sleep(waitMs)
+        }
+    }
 }
 
 function uploadPriority(remotePath) {
@@ -870,17 +925,32 @@ async function uploadDirectory(localDir, remotePrefix, concurrency = 4) {
     const workers = Math.max(1, Math.min(concurrency, files.length))
     let cursor = 0
     let completed = 0
+    let firstError = null
+    let shouldStop = false
 
     const runWorker = async () => {
         for (;;) {
+            if (shouldStop) return
             const currentIndex = cursor
             cursor += 1
             if (currentIndex >= files.length) return
             const file = files[currentIndex]
-            await uploadFile(file.localPath, file.remotePath)
-            completed += 1
-            if (completed === files.length || completed % 25 === 0) {
-                log(`Upload progress: ${completed}/${files.length}`)
+            try {
+                await uploadFile(file.localPath, file.remotePath)
+                completed += 1
+                if (completed === files.length || completed % 25 === 0) {
+                    log(`Upload progress: ${completed}/${files.length}`)
+                }
+            } catch (error) {
+                if (!firstError) {
+                    firstError = error instanceof Error ? error : new Error(String(error))
+                    shouldStop = true
+                    log(
+                        `Upload worker failed for ${file.remotePath}: ${firstError.message}`,
+                        "error",
+                    )
+                }
+                return
             }
         }
     }
@@ -890,6 +960,9 @@ async function uploadDirectory(localDir, remotePrefix, concurrency = 4) {
         pending.push(runWorker())
     }
     await Promise.all(pending)
+    if (firstError) {
+        throw firstError
+    }
 }
 
 function isAutoSubtitleModeEnabled() {
@@ -942,6 +1015,8 @@ async function generateAutoSubtitleTrack({
         CONFIG.subtitles.computeType,
         "--beam-size",
         String(CONFIG.subtitles.beamSize),
+        "--progress-every-segments",
+        String(CONFIG.subtitles.progressEverySegments),
     ]
     const explicitLanguage = normalizeSubtitleLanguage(language)
     if (explicitLanguage && explicitLanguage !== AUTO_SUBTITLE_LANG_TOKEN && explicitLanguage !== "und") {
@@ -1338,7 +1413,7 @@ async function runLoop() {
             ? CONFIG.subtitles.languages.join(",")
             : AUTO_SUBTITLE_LANG_TOKEN
         log(
-            `Auto subtitle config: model=${CONFIG.subtitles.model} device=${CONFIG.subtitles.device} compute_type=${CONFIG.subtitles.computeType} languages=${languagesLog} required=${CONFIG.subtitles.required}`,
+            `Auto subtitle config: model=${CONFIG.subtitles.model} device=${CONFIG.subtitles.device} compute_type=${CONFIG.subtitles.computeType} beam_size=${CONFIG.subtitles.beamSize} progress_every_segments=${CONFIG.subtitles.progressEverySegments} languages=${languagesLog} required=${CONFIG.subtitles.required}`,
         )
         log(
             `Subtitle preprocess: enabled=${CONFIG.subtitles.preprocessAudio} required=${CONFIG.subtitles.preprocessRequired} channels=${CONFIG.subtitles.preprocessChannels} sample_rate=${CONFIG.subtitles.preprocessSampleRate}`,
