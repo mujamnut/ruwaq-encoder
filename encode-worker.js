@@ -428,6 +428,12 @@ const CONFIG = {
     uploadConcurrency: parsePositiveInt(process.env.ENCODER_UPLOAD_CONCURRENCY, 4),
     uploadMaxAttempts: parsePositiveInt(process.env.ENCODER_UPLOAD_MAX_ATTEMPTS, 4),
     uploadRetryDelayMs: parsePositiveInt(process.env.ENCODER_UPLOAD_RETRY_DELAY_MS, 750),
+    playlistCacheControl:
+        normalizeOptionalString(process.env.ENCODER_PLAYLIST_CACHE_CONTROL)
+        || "public, max-age=120, s-maxage=300, stale-while-revalidate=600",
+    segmentCacheControl:
+        normalizeOptionalString(process.env.ENCODER_SEGMENT_CACHE_CONTROL)
+        || "public, max-age=31536000, immutable",
     ffmpegPreset: process.env.ENCODER_FFMPEG_PRESET || "veryfast",
     qualities: sortQualitiesAscending(parseQualities()),
     subtitles: {
@@ -857,8 +863,8 @@ async function uploadFile(localPath, remotePath) {
                     ? "application/x-subrip; charset=utf-8"
                     : "application/octet-stream"
     const cacheControl = remotePath.endsWith(".m3u8")
-        ? "public, max-age=30, s-maxage=30, stale-while-revalidate=60"
-        : "public, max-age=31536000, immutable"
+        ? CONFIG.playlistCacheControl
+        : CONFIG.segmentCacheControl
     const maxAttempts = Math.max(1, CONFIG.uploadMaxAttempts)
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -1407,6 +1413,7 @@ async function runLoop() {
     log(`B2 bucket: ${CONFIG.b2.bucketName}`)
     log(`B2 region: ${CONFIG.b2.region}`)
     log(`Upload concurrency: ${CONFIG.uploadConcurrency}`)
+    log(`Cache policy: playlists="${CONFIG.playlistCacheControl}" segments="${CONFIG.segmentCacheControl}"`)
     log(`Subtitle mode: ${CONFIG.subtitles.mode}`)
     if (isAutoSubtitleModeEnabled()) {
         const languagesLog = CONFIG.subtitles.languages.length > 0
