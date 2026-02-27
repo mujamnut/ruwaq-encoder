@@ -19,9 +19,9 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/clien
 require("dotenv").config()
 
 const DEFAULT_QUALITIES = [
-    { name: "360p", width: 640, height: 360, bitrate: "600k", maxrate: "750k", bufsize: "1200k", audioBitrate: "96k" },
-    { name: "540p", width: 960, height: 540, bitrate: "1200k", maxrate: "1500k", bufsize: "2400k", audioBitrate: "128k" },
-    { name: "720p", width: 1280, height: 720, bitrate: "2200k", maxrate: "2800k", bufsize: "4200k", audioBitrate: "128k" },
+    { name: "360p", width: 640, height: 360, bitrate: "500k", maxrate: "650k", bufsize: "1000k", audioBitrate: "96k" },
+    { name: "540p", width: 960, height: 540, bitrate: "1000k", maxrate: "1300k", bufsize: "2000k", audioBitrate: "96k" },
+    { name: "720p", width: 1280, height: 720, bitrate: "1800k", maxrate: "2400k", bufsize: "3600k", audioBitrate: "96k" },
 ]
 const MAX_SUBTITLE_TRACKS = 10
 const AUTO_SUBTITLE_LANG_TOKEN = "auto"
@@ -365,6 +365,23 @@ function parseHlsSegmentType(value) {
     return "fmp4"
 }
 
+function parseBitrateToBps(value, fallbackBps = 0) {
+    const raw = normalizeOptionalString(value)
+    if (!raw) return fallbackBps
+
+    const normalized = raw.toLowerCase()
+    const parsed = Number.parseFloat(normalized)
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallbackBps
+
+    if (normalized.endsWith("k")) return Math.round(parsed * 1000)
+    if (normalized.endsWith("m")) return Math.round(parsed * 1000 * 1000)
+    if (normalized.endsWith("g")) return Math.round(parsed * 1000 * 1000 * 1000)
+
+    // Treat bare numbers as kbps when small (legacy config style), else bps.
+    if (parsed < 10000) return Math.round(parsed * 1000)
+    return Math.round(parsed)
+}
+
 function normalizeQualityName(value) {
     return String(value || "").trim().toLowerCase()
 }
@@ -433,6 +450,8 @@ const CONFIG = {
     cdnBaseUrl: (process.env.CDN_BASE_URL || "https://videos.mujam.store").replace(/\/+$/, ""),
     segmentDurationSeconds: parsePositiveInt(process.env.ENCODER_SEGMENT_DURATION_SECONDS, 2),
     hlsSegmentType: parseHlsSegmentType(process.env.ENCODER_HLS_SEGMENT_TYPE),
+    hlsSharedAudioTrack: parseEnvBoolean(process.env.ENCODER_HLS_SHARED_AUDIO_TRACK, true),
+    hlsSharedAudioBitrate: normalizeOptionalString(process.env.ENCODER_HLS_SHARED_AUDIO_BITRATE) || "96k",
     uploadConcurrency: parsePositiveInt(process.env.ENCODER_UPLOAD_CONCURRENCY, 4),
     uploadMaxAttempts: parsePositiveInt(process.env.ENCODER_UPLOAD_MAX_ATTEMPTS, 4),
     uploadRetryDelayMs: parsePositiveInt(process.env.ENCODER_UPLOAD_RETRY_DELAY_MS, 750),
@@ -734,6 +753,7 @@ async function transcodeToHls({
 }) {
     const segmentDurationSeconds = CONFIG.segmentDurationSeconds
     const isFmp4Segments = CONFIG.hlsSegmentType === "fmp4"
+    const useSharedAudioTrack = hasAudio && CONFIG.hlsSharedAudioTrack
     const segmentExtension = isFmp4Segments ? "m4s" : "ts"
     const keyint = Math.max(24, Math.round(fps * segmentDurationSeconds))
     ensureDir(outputDir)
@@ -747,7 +767,7 @@ async function transcodeToHls({
     const ffmpegArgs = ["-i", inputPath, "-filter_complex", filterComplex]
     qualities.forEach((quality, index) => {
         ffmpegArgs.push("-map", `[v${index}]`)
-        if (hasAudio) {
+        if (!useSharedAudioTrack && hasAudio) {
             ffmpegArgs.push("-map", "0:a:0")
         }
         ffmpegArgs.push(
@@ -762,7 +782,7 @@ async function transcodeToHls({
             `-preset:v:${index}`,
             CONFIG.ffmpegPreset,
         )
-        if (hasAudio) {
+        if (!useSharedAudioTrack && hasAudio) {
             ffmpegArgs.push(
                 `-c:a:${index}`,
                 "aac",
@@ -772,14 +792,37 @@ async function transcodeToHls({
         }
     })
 
-    const streamMap = qualities
-        .map((quality, index) => {
-            if (hasAudio) {
-                return `v:${index},a:${index},name:${quality.name}`
-            }
-            return `v:${index},name:${quality.name}`
-        })
-        .join(" ")
+    if (useSharedAudioTrack) {
+        ffmpegArgs.push(
+            "-map",
+            "0:a:0",
+            "-c:a:0",
+            "aac",
+            "-ac:a:0",
+            "2",
+            "-ar:a:0",
+            "48000",
+            "-b:a:0",
+            CONFIG.hlsSharedAudioBitrate,
+        )
+    }
+
+    const streamMap = (() => {
+        if (useSharedAudioTrack) {
+            const videoStreams = qualities.map((quality, index) => `v:${index},agroup:audio,name:${quality.name}`)
+            const audioStream = "a:0,agroup:audio,name:audio,default:yes,language:und"
+            return [...videoStreams, audioStream].join(" ")
+        }
+
+        return qualities
+            .map((quality, index) => {
+                if (hasAudio) {
+                    return `v:${index},a:${index},name:${quality.name}`
+                }
+                return `v:${index},name:${quality.name}`
+            })
+            .join(" ")
+    })()
 
     ffmpegArgs.push(
         "-g",
@@ -816,6 +859,9 @@ async function transcodeToHls({
     )
 
     qualities.forEach((quality) => ensureDir(path.join(outputDir, quality.name)))
+    if (useSharedAudioTrack) {
+        ensureDir(path.join(outputDir, "audio"))
+    }
 
     await new Promise((resolve, reject) => {
         const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: "inherit" })
@@ -827,13 +873,24 @@ async function transcodeToHls({
     })
 
     let masterPlaylist = `#EXTM3U\n#EXT-X-VERSION:${isFmp4Segments ? 7 : 3}\n`
+    const sharedAudioBitrate = parseBitrateToBps(CONFIG.hlsSharedAudioBitrate, parseBitrateToBps("96k", 96000))
+    if (useSharedAudioTrack) {
+        masterPlaylist += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",LANGUAGE="und",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n`
+    }
+
     qualities.forEach((quality) => {
-        const videoBitrate = parseInt(String(quality.bitrate).replace(/[^\d]/g, ""), 10) * 1000
-        const audioBitrate = hasAudio
-            ? parseInt(String(quality.audioBitrate || "96k").replace(/[^\d]/g, ""), 10) * 1000
+        const videoBitrate = parseBitrateToBps(quality.bitrate, 0)
+        const audioBitrate = useSharedAudioTrack
+            ? sharedAudioBitrate
+            : hasAudio
+                ? parseBitrateToBps(quality.audioBitrate || "96k", parseBitrateToBps("96k", 96000))
             : 0
-        const bandwidth = videoBitrate + audioBitrate
-        masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${quality.width}x${quality.height},NAME="${quality.name}"\n`
+        const bandwidth = Math.max(1, videoBitrate + audioBitrate)
+        if (useSharedAudioTrack) {
+            masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${quality.width}x${quality.height},NAME="${quality.name}",AUDIO="audio"\n`
+        } else {
+            masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${quality.width}x${quality.height},NAME="${quality.name}"\n`
+        }
         masterPlaylist += `${quality.name}/playlist.m3u8\n`
     })
     fs.writeFileSync(path.join(outputDir, "master.m3u8"), masterPlaylist)
@@ -1437,6 +1494,8 @@ async function runLoop() {
     log(`B2 region: ${CONFIG.b2.region}`)
     log(`Upload concurrency: ${CONFIG.uploadConcurrency}`)
     log(`HLS segment type: ${CONFIG.hlsSegmentType}`)
+    log(`HLS shared audio track: enabled=${CONFIG.hlsSharedAudioTrack} bitrate=${CONFIG.hlsSharedAudioBitrate}`)
+    log(`HLS ladder: ${CONFIG.qualities.map((quality) => `${quality.name}:${quality.bitrate}`).join(",")}`)
     log(`Cache policy: playlists="${CONFIG.playlistCacheControl}" segments="${CONFIG.segmentCacheControl}"`)
     log(`Subtitle mode: ${CONFIG.subtitles.mode}`)
     if (isAutoSubtitleModeEnabled()) {

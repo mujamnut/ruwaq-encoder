@@ -39,12 +39,15 @@ const CONFIG = {
     cdnBaseUrl: process.env.CDN_BASE_URL || 'https://videos.mujam.store',
     // Temp directory for processing
     tempDir: path.join(process.env.TEMP || 'C:\\Temp', 'video-transcoding'),
+    // HLS output tuning
+    hlsSharedAudioTrack: (process.env.ENCODER_HLS_SHARED_AUDIO_TRACK || 'true').toLowerCase() === 'true',
+    hlsSharedAudioBitrate: process.env.ENCODER_HLS_SHARED_AUDIO_BITRATE || '96k',
     // Quality presets
     qualities: [
-        { name: '240p', width: 426, height: 240, bitrate: '350k', maxrate: '420k', bufsize: '700k', audioBitrate: '64k' },
-        { name: '360p', width: 640, height: 360, bitrate: '600k', maxrate: '750k', bufsize: '1200k', audioBitrate: '96k' },
-        { name: '540p', width: 960, height: 540, bitrate: '1200k', maxrate: '1500k', bufsize: '2400k', audioBitrate: '128k' },
-        { name: '720p', width: 1280, height: 720, bitrate: '2200k', maxrate: '2800k', bufsize: '4200k', audioBitrate: '128k' },
+        { name: '240p', width: 426, height: 240, bitrate: '280k', maxrate: '360k', bufsize: '560k', audioBitrate: '64k' },
+        { name: '360p', width: 640, height: 360, bitrate: '500k', maxrate: '650k', bufsize: '1000k', audioBitrate: '96k' },
+        { name: '540p', width: 960, height: 540, bitrate: '1000k', maxrate: '1300k', bufsize: '2000k', audioBitrate: '96k' },
+        { name: '720p', width: 1280, height: 720, bitrate: '1800k', maxrate: '2400k', bufsize: '3600k', audioBitrate: '96k' },
     ],
 };
 
@@ -92,6 +95,18 @@ function cleanDir(dirPath) {
     if (fs.existsSync(dirPath)) {
         fs.rmSync(dirPath, { recursive: true, force: true });
     }
+}
+
+function parseBitrateToBps(value, fallback = 0) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return fallback;
+    const parsed = Number.parseFloat(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    if (raw.endsWith('k')) return Math.round(parsed * 1000);
+    if (raw.endsWith('m')) return Math.round(parsed * 1000 * 1000);
+    if (raw.endsWith('g')) return Math.round(parsed * 1000 * 1000 * 1000);
+    if (parsed < 10000) return Math.round(parsed * 1000);
+    return Math.round(parsed);
 }
 
 async function getVideoDuration(inputPath) {
@@ -160,8 +175,10 @@ async function getVideoFps(inputPath) {
 async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
     log(`Transcoding video to HLS with ${qualities.length} quality levels...`, 'progress');
     const segmentDurationSeconds = 2;
+    const useSharedAudioTrack = CONFIG.hlsSharedAudioTrack;
     const keyint = Math.max(24, Math.round(fps * segmentDurationSeconds));
     log(`Using keyint=${keyint} for ${segmentDurationSeconds}s segments (fps=${fps.toFixed(2)})`, 'info');
+    log(`Shared audio track: enabled=${useSharedAudioTrack} bitrate=${CONFIG.hlsSharedAudioBitrate}`, 'info');
 
     ensureDir(outputDir);
 
@@ -177,9 +194,6 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
     // Remove trailing semicolon
     filterComplex = filterComplex.slice(0, -1);
 
-    // Build the full command
-    const varStreamMap = qualities.map((q, i) => `v:${i},a:${i},name:${q.name}`).join(' ');
-
     const ffmpegArgs = [
         '-i', inputPath,
         '-filter_complex', filterComplex,
@@ -187,18 +201,42 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
 
     // Add mappings and codec settings for each quality
     qualities.forEach((q, i) => {
+        ffmpegArgs.push('-map', `[v${i}]`);
+        if (!useSharedAudioTrack) {
+            ffmpegArgs.push('-map', '0:a?');
+        }
         ffmpegArgs.push(
-            '-map', `[v${i}]`,
-            '-map', '0:a?',
             `-c:v:${i}`, 'libx264',
             `-b:v:${i}`, q.bitrate,
             `-maxrate:v:${i}`, q.maxrate || q.bitrate,
             `-bufsize:v:${i}`, q.bufsize || q.maxrate || q.bitrate,
             `-preset:v:${i}`, 'veryfast',
-            `-c:a:${i}`, 'aac',
-            `-b:a:${i}`, q.audioBitrate
         );
+        if (!useSharedAudioTrack) {
+            ffmpegArgs.push(
+                `-c:a:${i}`, 'aac',
+                `-b:a:${i}`, q.audioBitrate
+            );
+        }
     });
+
+    if (useSharedAudioTrack) {
+        ffmpegArgs.push(
+            '-map', '0:a?',
+            '-c:a:0', 'aac',
+            '-ac:a:0', '2',
+            '-ar:a:0', '48000',
+            '-b:a:0', CONFIG.hlsSharedAudioBitrate,
+        );
+    }
+
+    const varStreamMap = (() => {
+        if (useSharedAudioTrack) {
+            const videos = qualities.map((q, i) => `v:${i},agroup:audio,name:${q.name}`);
+            return [...videos, 'a:0,agroup:audio,name:audio,default:yes,language:und'].join(' ');
+        }
+        return qualities.map((q, i) => `v:${i},a:${i},name:${q.name}`).join(' ');
+    })();
 
     ffmpegArgs.push(
         '-g', String(keyint),
@@ -218,6 +256,9 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
 
     // Create quality directories
     qualities.forEach(q => ensureDir(path.join(outputDir, q.name)));
+    if (useSharedAudioTrack) {
+        ensureDir(path.join(outputDir, 'audio'));
+    }
 
     await new Promise((resolve, reject) => {
         const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: 'inherit' });
@@ -241,14 +282,23 @@ async function transcodeToHLS(inputPath, outputDir, qualities, fps = 30) {
     log('Creating master playlist...', 'progress');
 
     let masterPlaylist = '#EXTM3U\n#EXT-X-VERSION:7\n';
+    const sharedAudioBitrate = parseBitrateToBps(CONFIG.hlsSharedAudioBitrate, parseBitrateToBps('96k', 96000));
+    if (useSharedAudioTrack) {
+        masterPlaylist += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",LANGUAGE="und",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n';
+    }
 
     qualities.forEach(q => {
         // Calculate bandwidth (bitrate in bits per second)
-        const videoBitrate = parseInt(q.bitrate) * 1000;
-        const audioBitrate = parseInt(q.audioBitrate) * 1000;
+        const videoBitrate = parseBitrateToBps(q.bitrate, 0);
+        const audioBitrate = useSharedAudioTrack
+            ? sharedAudioBitrate
+            : parseBitrateToBps(q.audioBitrate, parseBitrateToBps('96k', 96000));
         const bandwidth = videoBitrate + audioBitrate;
-
-        masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${q.width}x${q.height},NAME="${q.name}"\n`;
+        if (useSharedAudioTrack) {
+            masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${q.width}x${q.height},NAME="${q.name}",AUDIO="audio"\n`;
+        } else {
+            masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${q.width}x${q.height},NAME="${q.name}"\n`;
+        }
         masterPlaylist += `${q.name}/playlist.m3u8\n`;
     });
 
